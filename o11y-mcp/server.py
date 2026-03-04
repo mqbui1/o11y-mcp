@@ -711,6 +711,10 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "environment": {
+                        "type": "string",
+                        "description": "APM environment to search (e.g. 'mcp-68e4-workshop'). Strongly recommended — searches without an environment filter may fail.",
+                    },
                     "services": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -1114,13 +1118,12 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         # ── APM Traces ────────────────────────────────────────────────────────
         case "get_trace":
+            # FIX: /v2/apm/profiling/v2/traceSnapshotSummaries is an APP_URL
+            # endpoint (app.<realm>.signalfx.com), not the API base URL.
             trace_id = args["trace_id"]
-            start_ms = args.get("startTimeMs")
-            end_ms = args.get("endTimeMs")
-            if not start_ms or not end_ms:
-                now_ms = int(time.time() * 1000)
-                start_ms = now_ms - 3_600_000
-                end_ms = now_ms
+            now_ms = int(time.time() * 1000)
+            start_ms = args.get("startTimeMs", now_ms - 3_600_000)
+            end_ms = args.get("endTimeMs", now_ms)
             return splunk_request(
                 "GET",
                 "/v2/apm/profiling/v2/traceSnapshotSummaries" + qs({
@@ -1131,91 +1134,457 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 base_url=APP_URL,
             )
 
+        case "get_trace_full":
+            # Uses the APM GraphQL endpoint on APP_URL — confirmed working.
+            trace_id = args["trace_id"]
+            query = (
+                "query TraceFullDetailsLessValidation($id: ID!) {"
+                " trace(id: $id) {"
+                " traceID startTime duration"
+                " spans { spanID operationName serviceName"
+                " startTime duration tags { key value } } } }"
+            )
+            gql_body = {
+                "operationName": "TraceFullDetailsLessValidation",
+                "variables": {"id": trace_id},
+                "query": query,
+            }
+            return splunk_request(
+                "POST",
+                "/v2/apm/graphql?op=TraceFullDetailsLessValidation",
+                gql_body,
+                base_url=APP_URL,
+            )
+
         case "get_trace_analysis":
-            return splunk_request("GET", f"/v2/apm/traces/{args['trace_id']}/analysis")
+            # FIX: /v2/apm/traces/{id}/analysis does not exist.
+            # The trace analysis GraphQL query is the correct approach.
+            trace_id = args["trace_id"]
+            query = (
+                "query TraceAnalysis($id: ID!) {"
+                " trace(id: $id) {"
+                " traceID startTime duration"
+                " spans {"
+                "   spanID operationName serviceName parentSpanID"
+                "   startTime duration"
+                "   tags { key value }"
+                " } } }"
+            )
+            gql_body = {
+                "operationName": "TraceAnalysis",
+                "variables": {"id": trace_id},
+                "query": query,
+            }
+            result = splunk_request(
+                "POST",
+                "/v2/apm/graphql?op=TraceAnalysis",
+                gql_body,
+                base_url=APP_URL,
+            )
+            # Post-process: derive latency contributors and anomalies from span data
+            spans = (result.get("data", {}).get("trace") or {}).get("spans", [])
+            if not spans:
+                return result
+            sorted_by_duration = sorted(spans, key=lambda s: s.get("duration", 0), reverse=True)
+            total_duration = sum(s.get("duration", 0) for s in spans)
+            analysis = {
+                "traceID": trace_id,
+                "totalDuration": result.get("data", {}).get("trace", {}).get("duration"),
+                "spanCount": len(spans),
+                "topLatencyContributors": [
+                    {
+                        "spanID": s["spanID"],
+                        "operationName": s.get("operationName"),
+                        "serviceName": s.get("serviceName"),
+                        "duration": s.get("duration"),
+                        "percentOfTrace": round(s.get("duration", 0) / total_duration * 100, 1) if total_duration else 0,
+                    }
+                    for s in sorted_by_duration[:5]
+                ],
+                "rawTrace": result,
+            }
+            return analysis
 
         case "search_traces":
-            # Use traceSnapshotSummaries search endpoint discovered from UI network traffic
-            body = {k: v for k, v in {
-                "services":      args.get("services"),
-                "operations":    args.get("operations"),
-                "tags":          args.get("tags"),
-                "startTimeMs":   args.get("startTimeMs"),
-                "endTimeMs":     args.get("endTimeMs"),
-                "minDurationMs": args.get("minDurationMs"),
-                "maxDurationMs": args.get("maxDurationMs"),
-                "limit":         args.get("limit", 20),
-            }.items() if v is not None}
-            return splunk_request("POST", "/v2/apm/traceSnapshotSummaries/search", body)
+            # Uses the same two-step GraphQL pattern as the Trace Analyzer UI:
+            #   1. POST StartAnalyticsSearch  → returns a jobId + initial partial data
+            #   2. POST GetAnalyticsSearch    → poll with jobId until isComplete=true
+            # Results are in legacyTraceExamples inside the traceExamples section.
+            now_ms = int(time.time() * 1000)
+            start_ms = args.get("startTimeMs", now_ms - 3_600_000)
+            end_ms = args.get("endTimeMs", now_ms)
+            limit = args.get("limit", 50)
+
+            # Build filters — environment, service, operation, tags, error, duration
+            trace_filters = []
+            tag_filters = []
+            if args.get("environment"):
+                tag_filters.append({
+                    "tag": "sf_environment", "operation": "IN",
+                    "values": [args["environment"]],
+                })
+            if args.get("services"):
+                tag_filters.append({
+                    "tag": "sf_service", "operation": "IN",
+                    "values": args["services"],
+                })
+            if args.get("operations"):
+                tag_filters.append({
+                    "tag": "sf_operation", "operation": "IN",
+                    "values": args["operations"],
+                })
+            if args.get("tags"):
+                for k, v in args["tags"].items():
+                    tag_filters.append({
+                        "tag": k, "operation": "IN",
+                        "values": [v] if isinstance(v, str) else v,
+                    })
+            if tag_filters:
+                trace_filters.append({
+                    "traceFilter": {"tags": tag_filters},
+                    "filterType": "traceFilter",
+                })
+
+            duration_filter = {}
+            if args.get("minDurationMs"):
+                duration_filter["gte"] = args["minDurationMs"]
+            if args.get("maxDurationMs"):
+                duration_filter["lte"] = args["maxDurationMs"]
+            if duration_filter:
+                trace_filters.append({
+                    "durationFilter": {"durationMillis": duration_filter},
+                    "filterType": "durationFilter",
+                })
+
+            parameters = {
+                "sharedParameters": {
+                    "timeRangeMillis": {"gte": start_ms, "lte": end_ms},
+                    "filters": trace_filters,
+                    "samplingFactor": 100,
+                },
+                "sectionsParameters": [
+                    {"sectionType": "traceExamples", "limit": limit},
+                ],
+            }
+
+            # Step 1: start the async search job
+            start_body = {
+                "operationName": "StartAnalyticsSearch",
+                "variables": {"parameters": parameters},
+                "query": (
+                    "query StartAnalyticsSearch($parameters: JSON!) {\n"
+                    "  startAnalyticsSearch(parameters: $parameters)\n"
+                    "}\n"
+                ),
+            }
+            start_result = splunk_request(
+                "POST", "/v2/apm/graphql?op=StartAnalyticsSearch",
+                start_body, base_url=APP_URL,
+            )
+            job_id = (
+                (start_result.get("data") or {})
+                .get("startAnalyticsSearch") or {}
+            ).get("jobId")
+            if not job_id:
+                return {"error": "StartAnalyticsSearch did not return a jobId", "raw": start_result}
+
+            # Step 2: poll until traceExamples section is complete (max 10 attempts)
+            get_body = {
+                "operationName": "GetAnalyticsSearch",
+                "variables": {"jobId": job_id},
+                "query": (
+                    "query GetAnalyticsSearch($jobId: ID!) {\n"
+                    "  getAnalyticsSearch(jobId: $jobId)\n"
+                    "}\n"
+                ),
+            }
+            examples = []
+            for attempt in range(10):
+                poll_result = splunk_request(
+                    "POST", "/v2/apm/graphql?op=GetAnalyticsSearch",
+                    get_body, base_url=APP_URL,
+                )
+                sections = (
+                    (poll_result.get("data") or {})
+                    .get("getAnalyticsSearch") or {}
+                ).get("sections", [])
+                for section in sections:
+                    if section.get("sectionType") == "traceExamples":
+                        examples = section.get("legacyTraceExamples") or []
+                        if section.get("isComplete"):
+                            return {
+                                "traces": examples[:limit],
+                                "traceCount": len(examples),
+                                "jobId": job_id,
+                                "isComplete": True,
+                            }
+                # Not complete yet — brief pause before next poll
+                time.sleep(0.5)
+
+            # Return whatever we have if we hit the poll limit
+            return {
+                "traces": examples[:limit],
+                "traceCount": len(examples),
+                "jobId": job_id,
+                "isComplete": False,
+                "note": "Search job did not complete within poll limit. Partial results returned.",
+            }
 
         case "search_trace_span_tags":
-            body = {k: v for k, v in {
-                "services":    args.get("services"),
-                "operations":  args.get("operations"),
-                "startTimeMs": args.get("startTimeMs"),
-                "endTimeMs":   args.get("endTimeMs"),
-                "tags":        args.get("tags"),
-            }.items() if v is not None}
-            return splunk_request("POST", "/v2/apm/traces/spantags", body)
+            # FIX: /v2/apm/traces/spantags does not exist.
+            # Indexed span tags are exposed via the Troubleshooting MetricSets
+            # dimension API. Query /v2/dimension for sf_service-scoped tag keys.
+            query_parts = []
+            if args.get("services"):
+                svc_filter = " OR ".join(f"sf_service:{s}" for s in args["services"])
+                query_parts.append(f"({svc_filter})")
+            query = " AND ".join(query_parts) if query_parts else "sf_key:*"
+            return splunk_request("GET", "/v2/dimension" + qs({
+                "query": query,
+                "limit": args.get("limit", 100),
+                "offset": args.get("offset", 0),
+            }))
 
         case "list_trace_services":
-            # FIXED: Use POST /v2/apm/traces/services with JSON body (not GET with query params)
-            body = {k: v for k, v in {
-                "services": args.get("services"),
-            }.items() if v is not None}
-            return splunk_request("POST", "/v2/apm/traces/services", body)
+            # FIX: /v2/apm/traces/services does not exist.
+            # Use POST /v2/apm/topology with a broad recent time window instead —
+            # it returns all active services and is the correct documented endpoint.
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            two_days_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 172_800))
+            body: dict = {"timeRange": f"{two_days_ago}/{now}"}
+            if args.get("services"):
+                body["tagFilters"] = [
+                    {"name": "sf_service", "operator": "equals", "value": s, "scope": "global"}
+                    for s in args["services"]
+                ]
+            result = splunk_request("POST", "/v2/apm/topology", body)
+            # Reshape to match the expected tool contract: list of service names + operations
+            nodes = (result.get("data") or {}).get("nodes", [])
+            return {
+                "services": [
+                    {"serviceName": n["serviceName"], "inferred": n.get("inferred", False)}
+                    for n in nodes
+                ],
+                "count": len(nodes),
+            }
 
         case "get_trace_outliers":
-            body = {k: v for k, v in {
-                "services":    args.get("services"),
-                "operations":  args.get("operations"),
-                "startTimeMs": args.get("startTimeMs"),
-                "endTimeMs":   args.get("endTimeMs"),
-                "tags":        args.get("tags"),
-                "limit":       args.get("limit", 20),
-            }.items() if v is not None}
-            return splunk_request("POST", "/v2/apm/traces/outliers", body)
+            # traceSnapshotSummaries requires a known traceId — it cannot be
+            # used as an open search. Instead we use SignalFlow to find the
+            # highest-latency metric windows for the service, which identifies
+            # when outlier traces are most likely to have occurred. Callers can
+            # then use get_trace_full with a known ID from those windows.
+            now_ms = int(time.time() * 1000)
+            start_ms = args.get("startTimeMs", now_ms - 3_600_000)
+            end_ms = args.get("endTimeMs", now_ms)
+            limit = args.get("limit", 10)
+
+            svc_filter = ""
+            if args.get("services"):
+                svc_filter = f", filter=filter('sf_service', '{args['services'][0]}')"
+            if args.get("operations"):
+                op = args["operations"][0]
+                svc_filter += f".filter(filter('sf_operation', '{op}'))"
+
+            program = (
+                f"data('service.request.duration.ns.p99'{svc_filter})"
+                f".publish(label='p99_latency')"
+            )
+
+            query_params = {
+                "start":     start_ms,
+                "stop":      end_ms,
+                "immediate": "true",
+            }
+            url = f"{STREAM_URL}/v2/signalflow/execute" + qs(query_params)
+            headers = {"X-SF-Token": ACCESS_TOKEN, "Content-Type": "text/plain"}
+            req = urllib.request.Request(url, data=program.encode(), headers=headers, method="POST")
+
+            data_points = []
+            metadata = {}
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    raw_body = resp.read().decode("utf-8")
+                events = raw_body.strip().split("\n\n")
+                for event in events:
+                    lines = [l[5:] if l.startswith("data:") else l
+                             for l in event.splitlines()
+                             if l.startswith("data:")]
+                    payload = "".join(lines).strip()
+                    if not payload:
+                        continue
+                    try:
+                        msg = json.loads(payload)
+                        if msg.get("type") == "data":
+                            for pt in msg.get("data", []):
+                                if pt.get("value") is not None:
+                                    data_points.append({
+                                        "tsId": pt.get("tsId"),
+                                        "value": pt.get("value"),
+                                        "timestampMs": msg.get("logicalTimestampMs"),
+                                    })
+                        elif msg.get("type") == "metadata":
+                            metadata[msg.get("tsId")] = msg.get("properties", {})
+                    except json.JSONDecodeError:
+                        pass
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(f"Splunk API error {e.code}: {e.read().decode()}")
+
+            # Sort by value descending and take top N
+            data_points.sort(key=lambda x: x.get("value", 0), reverse=True)
+            outliers = []
+            for pt in data_points[:limit]:
+                meta = metadata.get(pt["tsId"], {})
+                outliers.append({
+                    "timestampMs":   pt["timestampMs"],
+                    "p99LatencyNs":  pt["value"],
+                    "p99LatencyMs":  round(pt["value"] / 1_000_000, 2) if pt["value"] else None,
+                    "service":       meta.get("sf_service"),
+                    "operation":     meta.get("sf_operation"),
+                    "environment":   meta.get("sf_environment"),
+                })
+
+            return {
+                "outliers": outliers,
+                "count": len(outliers),
+                "metric": "service.request.duration.ns.p99",
+                "note": "Outlier windows by p99 latency. Use get_trace_full with a known trace ID to inspect individual traces.",
+            }
 
         case "get_service_map_for_trace":
-            return splunk_request("GET", f"/v2/servicemap/trace/{args['trace_id']}")
+            # FIX: /v2/servicemap/trace/{id} does not exist.
+            # Use get_trace_full to get spans, then derive the service map from them.
+            trace_id = args["trace_id"]
+            query = (
+                "query TraceServiceMap($id: ID!) {"
+                " trace(id: $id) {"
+                " traceID"
+                " spans { spanID operationName serviceName parentSpanID startTime duration } } }"
+            )
+            gql_body = {
+                "operationName": "TraceServiceMap",
+                "variables": {"id": trace_id},
+                "query": query,
+            }
+            result = splunk_request(
+                "POST",
+                "/v2/apm/graphql?op=TraceServiceMap",
+                gql_body,
+                base_url=APP_URL,
+            )
+            spans = (result.get("data", {}).get("trace") or {}).get("spans", [])
+            # Build a service map from span parent-child relationships
+            span_map = {s["spanID"]: s for s in spans}
+            edges = set()
+            for span in spans:
+                parent_id = span.get("parentSpanID")
+                if parent_id and parent_id in span_map:
+                    parent_svc = span_map[parent_id].get("serviceName")
+                    child_svc = span.get("serviceName")
+                    if parent_svc and child_svc and parent_svc != child_svc:
+                        edges.add((parent_svc, child_svc))
+            services = list({s.get("serviceName") for s in spans if s.get("serviceName")})
+            return {
+                "traceID": trace_id,
+                "nodes": [{"serviceName": svc} for svc in services],
+                "edges": [{"fromNode": e[0], "toNode": e[1]} for e in edges],
+            }
 
         case "search_service_map":
-            body = {k: v for k, v in {
-                "services":    args.get("services"),
-                "operations":  args.get("operations"),
-                "startTimeMs": args.get("startTimeMs"),
-                "endTimeMs":   args.get("endTimeMs"),
-                "tags":        args.get("tags"),
-            }.items() if v is not None}
-            return splunk_request("POST", "/v2/apm/traces/servicemap", body)
+            # FIX: /v2/apm/traces/servicemap does not exist.
+            # Use POST /v2/apm/topology with time range derived from startTimeMs/endTimeMs.
+            now_ms = int(time.time() * 1000)
+            start_ms = args.get("startTimeMs", now_ms - 3_600_000)
+            end_ms = args.get("endTimeMs", now_ms)
+            start_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_ms / 1000))
+            end_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_ms / 1000))
+            body = {"timeRange": f"{start_iso}/{end_iso}"}
+            if args.get("services"):
+                body["tagFilters"] = [
+                    {"name": "sf_service", "operator": "equals", "value": s, "scope": "global"}
+                    for s in args["services"]
+                ]
+            return splunk_request("POST", "/v2/apm/topology", body)
 
-        case "get_trace_full":
-                    trace_id = args["trace_id"]
-                    query = (
-                        "query TraceFullDetailsLessValidation($id: ID!) {"
-                        " trace(id: $id) {"
-                        " traceID startTime duration"
-                        " spans { spanID operationName serviceName"
-                        " startTime duration tags { key value } } } }"
-                    )
-                    gql_body = {
-                        "operationName": "TraceFullDetailsLessValidation",
-                        "variables": {"id": trace_id},
-                        "query": query,
-                    }
-                    return splunk_request("POST", "/v2/apm/graphql?op=TraceFullDetailsLessValidation", gql_body, base_url=APP_URL)
         # ── SignalFlow ────────────────────────────────────────────────────────
         case "execute_signalflow":
+            # The SignalFlow execute endpoint expects:
+            #   - Content-Type: text/plain with the raw program as the body
+            #   - Timing params (start, stop, etc.) as URL query parameters
+            # The response is an SSE stream where each event is a multi-line
+            # JSON object. Lines are streamed one JSON-fragment per line, so we
+            # must read the entire response body and split on double-newlines
+            # (SSE event boundaries) to reconstruct complete JSON objects.
             now_ms = int(time.time() * 1000)
-            body = {k: v for k, v in {
-                "programText": args["program"],
+            query_params = {k: v for k, v in {
                 "start":      args.get("start", now_ms - 3_600_000),
                 "stop":       args.get("stop", now_ms),
                 "resolution": args.get("resolution"),
                 "maxDelay":   args.get("maxDelay"),
-                "immediate":  args.get("immediate", True),
+                "immediate":  str(args.get("immediate", True)).lower(),
             }.items() if v is not None}
-            return splunk_request("POST", "/v2/signalflow/execute", body, base_url=STREAM_URL)
+            url = f"{STREAM_URL}/v2/signalflow/execute" + qs(query_params)
+            headers = {
+                "X-SF-Token": ACCESS_TOKEN,
+                "Content-Type": "text/plain",
+            }
+            encoded = args["program"].encode("utf-8")
+            req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
+            messages = []
+            data_points = []
+            metadata = {}
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    raw_body = resp.read().decode("utf-8")
+
+                # Split on double newline to get individual SSE events
+                events = raw_body.strip().split("\n\n")
+                for event in events:
+                    # Each event may have multiple "data:" lines — join them
+                    lines = [l[5:] if l.startswith("data:") else l
+                             for l in event.splitlines()
+                             if l.startswith("data:") or (l and not l.startswith(":"))]
+                    payload = "".join(lines).strip()
+                    if not payload:
+                        continue
+                    try:
+                        msg = json.loads(payload)
+                        event_type = msg.get("type") or msg.get("event")
+                        if event_type == "data":
+                            for point in msg.get("data", []):
+                                if point.get("value") is not None:
+                                    data_points.append({
+                                        "tsId":        point.get("tsId"),
+                                        "value":       point.get("value"),
+                                        "timestampMs": msg.get("logicalTimestampMs"),
+                                    })
+                        elif event_type == "metadata":
+                            tsid = msg.get("tsId")
+                            if tsid:
+                                metadata[tsid] = msg.get("properties", {})
+                        elif event_type in ("done", "error"):
+                            messages.append(msg)
+                            break
+                        else:
+                            messages.append(msg)
+                    except json.JSONDecodeError:
+                        pass  # skip malformed fragments
+
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(f"Splunk API error {e.code}: {e.read().decode()}")
+
+            # Enrich data points with metadata (service name, metric, etc.)
+            enriched = []
+            for pt in data_points:
+                meta = metadata.get(pt["tsId"], {})
+                enriched.append({**pt, "properties": meta})
+
+            return {
+                "dataPoints": enriched,
+                "dataPointCount": len(enriched),
+                "events": messages,
+                "hasData": len(enriched) > 0,
+            }
 
         case _:
             raise ValueError(f"Unknown tool: {name}")
