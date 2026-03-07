@@ -1,21 +1,23 @@
 {
   "mcpServers": {
     "splunk-observability": {
-      "command": "uv",
+      "command": "/usr/local/bin/uv",
       "args": [
         "run",
         "--with",
-        "mcp",
+        "mcp[cli]",
+        "--script",
         "/Users/marcbui/Documents/o11y-mcp/server.py"
       ],
       "env": {
-        "SPLUNK_ACCESS_TOKEN": "",
-        "SPLUNK_REALM": "us1"
+        "SPLUNK_REALM": "us1",
+        "SPLUNK_ACCESS_TOKEN": ""
       }
     }
   },
   "preferences": {
-    "coworkScheduledTasksEnabled": false,
+    "coworkWebSearchEnabled": true,
+    "coworkScheduledTasksEnabled": true,
     "sidebarMode": "chat"
   }
 }
