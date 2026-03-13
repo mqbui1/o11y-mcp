@@ -929,15 +929,24 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
         case "get_detector":
             return splunk_request("GET", f"/v2/detector/{args['detector_id']}")
         case "create_detector":
+            # FIX: The Splunk /v2/detector API expects "programText" not "signalFlowText".
+            # The MCP tool schema uses "signalFlowText" as the user-facing parameter name,
+            # so we remap it here before sending the request body to the API.
             body = {k: v for k, v in {
-                "name": args.get("name"), "description": args.get("description"),
-                "signalFlowText": args.get("signalFlowText"), "rules": args.get("rules"),
-                "tags": args.get("tags"), "teams": args.get("teams"),
+                "name":           args.get("name"),
+                "description":    args.get("description"),
+                "programText":    args.get("signalFlowText"),  # ← remapped from signalFlowText
+                "rules":          args.get("rules"),
+                "tags":           args.get("tags"),
+                "teams":          args.get("teams"),
                 "programOptions": args.get("programOptions"),
             }.items() if v is not None}
             return splunk_request("POST", "/v2/detector", body)
         case "update_detector":
             detector_id = args.pop("detector_id")
+            # FIX: Same remapping — "signalFlowText" input param → "programText" API field.
+            if "signalFlowText" in args:
+                args["programText"] = args.pop("signalFlowText")
             return splunk_request("PUT", f"/v2/detector/{detector_id}",
                                   {k: v for k, v in args.items() if v is not None})
         case "delete_detector":
@@ -1118,8 +1127,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         # ── APM Traces ────────────────────────────────────────────────────────
         case "get_trace":
-            # FIX: /v2/apm/profiling/v2/traceSnapshotSummaries is an APP_URL
-            # endpoint (app.<realm>.signalfx.com), not the API base URL.
             trace_id = args["trace_id"]
             now_ms = int(time.time() * 1000)
             start_ms = args.get("startTimeMs", now_ms - 3_600_000)
@@ -1135,7 +1142,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             )
 
         case "get_trace_full":
-            # Uses the APM GraphQL endpoint on APP_URL — confirmed working.
             trace_id = args["trace_id"]
             query = (
                 "query TraceFullDetailsLessValidation($id: ID!) {"
@@ -1157,8 +1163,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             )
 
         case "get_trace_analysis":
-            # FIX: /v2/apm/traces/{id}/analysis does not exist.
-            # The trace analysis GraphQL query is the correct approach.
             trace_id = args["trace_id"]
             query = (
                 "query TraceAnalysis($id: ID!) {"
@@ -1181,7 +1185,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 gql_body,
                 base_url=APP_URL,
             )
-            # Post-process: derive latency contributors and anomalies from span data
             spans = (result.get("data", {}).get("trace") or {}).get("spans", [])
             if not spans:
                 return result
@@ -1206,16 +1209,11 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             return analysis
 
         case "search_traces":
-            # Uses the same two-step GraphQL pattern as the Trace Analyzer UI:
-            #   1. POST StartAnalyticsSearch  → returns a jobId + initial partial data
-            #   2. POST GetAnalyticsSearch    → poll with jobId until isComplete=true
-            # Results are in legacyTraceExamples inside the traceExamples section.
             now_ms = int(time.time() * 1000)
             start_ms = args.get("startTimeMs", now_ms - 3_600_000)
             end_ms = args.get("endTimeMs", now_ms)
             limit = args.get("limit", 50)
 
-            # Build filters — environment, service, operation, tags, error, duration
             trace_filters = []
             tag_filters = []
             if args.get("environment"):
@@ -1267,7 +1265,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 ],
             }
 
-            # Step 1: start the async search job
             start_body = {
                 "operationName": "StartAnalyticsSearch",
                 "variables": {"parameters": parameters},
@@ -1288,7 +1285,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             if not job_id:
                 return {"error": "StartAnalyticsSearch did not return a jobId", "raw": start_result}
 
-            # Step 2: poll until traceExamples section is complete (max 10 attempts)
             get_body = {
                 "operationName": "GetAnalyticsSearch",
                 "variables": {"jobId": job_id},
@@ -1318,10 +1314,8 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                                 "jobId": job_id,
                                 "isComplete": True,
                             }
-                # Not complete yet — brief pause before next poll
                 time.sleep(0.5)
 
-            # Return whatever we have if we hit the poll limit
             return {
                 "traces": examples[:limit],
                 "traceCount": len(examples),
@@ -1331,9 +1325,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }
 
         case "search_trace_span_tags":
-            # FIX: /v2/apm/traces/spantags does not exist.
-            # Indexed span tags are exposed via the Troubleshooting MetricSets
-            # dimension API. Query /v2/dimension for sf_service-scoped tag keys.
             query_parts = []
             if args.get("services"):
                 svc_filter = " OR ".join(f"sf_service:{s}" for s in args["services"])
@@ -1346,9 +1337,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }))
 
         case "list_trace_services":
-            # FIX: /v2/apm/traces/services does not exist.
-            # Use POST /v2/apm/topology with a broad recent time window instead —
-            # it returns all active services and is the correct documented endpoint.
             now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             two_days_ago = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 172_800))
             body: dict = {"timeRange": f"{two_days_ago}/{now}"}
@@ -1358,7 +1346,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                     for s in args["services"]
                 ]
             result = splunk_request("POST", "/v2/apm/topology", body)
-            # Reshape to match the expected tool contract: list of service names + operations
             nodes = (result.get("data") or {}).get("nodes", [])
             return {
                 "services": [
@@ -1369,11 +1356,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }
 
         case "get_trace_outliers":
-            # traceSnapshotSummaries requires a known traceId — it cannot be
-            # used as an open search. Instead we use SignalFlow to find the
-            # highest-latency metric windows for the service, which identifies
-            # when outlier traces are most likely to have occurred. Callers can
-            # then use get_trace_full with a known ID from those windows.
             now_ms = int(time.time() * 1000)
             start_ms = args.get("startTimeMs", now_ms - 3_600_000)
             end_ms = args.get("endTimeMs", now_ms)
@@ -1430,7 +1412,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             except urllib.error.HTTPError as e:
                 raise RuntimeError(f"Splunk API error {e.code}: {e.read().decode()}")
 
-            # Sort by value descending and take top N
             data_points.sort(key=lambda x: x.get("value", 0), reverse=True)
             outliers = []
             for pt in data_points[:limit]:
@@ -1452,8 +1433,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }
 
         case "get_service_map_for_trace":
-            # FIX: /v2/servicemap/trace/{id} does not exist.
-            # Use get_trace_full to get spans, then derive the service map from them.
             trace_id = args["trace_id"]
             query = (
                 "query TraceServiceMap($id: ID!) {"
@@ -1473,7 +1452,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 base_url=APP_URL,
             )
             spans = (result.get("data", {}).get("trace") or {}).get("spans", [])
-            # Build a service map from span parent-child relationships
             span_map = {s["spanID"]: s for s in spans}
             edges = set()
             for span in spans:
@@ -1491,8 +1469,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }
 
         case "search_service_map":
-            # FIX: /v2/apm/traces/servicemap does not exist.
-            # Use POST /v2/apm/topology with time range derived from startTimeMs/endTimeMs.
             now_ms = int(time.time() * 1000)
             start_ms = args.get("startTimeMs", now_ms - 3_600_000)
             end_ms = args.get("endTimeMs", now_ms)
@@ -1508,13 +1484,6 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         # ── SignalFlow ────────────────────────────────────────────────────────
         case "execute_signalflow":
-            # The SignalFlow execute endpoint expects:
-            #   - Content-Type: text/plain with the raw program as the body
-            #   - Timing params (start, stop, etc.) as URL query parameters
-            # The response is an SSE stream where each event is a multi-line
-            # JSON object. Lines are streamed one JSON-fragment per line, so we
-            # must read the entire response body and split on double-newlines
-            # (SSE event boundaries) to reconstruct complete JSON objects.
             now_ms = int(time.time() * 1000)
             query_params = {k: v for k, v in {
                 "start":      args.get("start", now_ms - 3_600_000),
@@ -1537,10 +1506,8 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 with urllib.request.urlopen(req) as resp:
                     raw_body = resp.read().decode("utf-8")
 
-                # Split on double newline to get individual SSE events
                 events = raw_body.strip().split("\n\n")
                 for event in events:
-                    # Each event may have multiple "data:" lines — join them
                     lines = [l[5:] if l.startswith("data:") else l
                              for l in event.splitlines()
                              if l.startswith("data:") or (l and not l.startswith(":"))]
@@ -1568,12 +1535,11 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                         else:
                             messages.append(msg)
                     except json.JSONDecodeError:
-                        pass  # skip malformed fragments
+                        pass
 
             except urllib.error.HTTPError as e:
                 raise RuntimeError(f"Splunk API error {e.code}: {e.read().decode()}")
 
-            # Enrich data points with metadata (service name, metric, etc.)
             enriched = []
             for pt in data_points:
                 meta = metadata.get(pt["tsId"], {})
