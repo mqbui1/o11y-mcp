@@ -11,6 +11,7 @@ Required env vars:
 
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -35,6 +36,84 @@ BASE_URL   = f"https://api.{REALM}.signalfx.com"
 APP_URL    = f"https://app.{REALM}.signalfx.com"
 STREAM_URL = f"https://stream.{REALM}.signalfx.com"
 INGEST_URL = f"https://ingest.{REALM}.signalfx.com"
+
+# ── SignalFlow Sanitizer ───────────────────────────────────────────────────────
+
+def _sanitize_signalflow(program: str) -> str:
+    """
+    Auto-fix the two most common SignalFlow mistakes before sending to the API.
+
+    Fix 1 — detect() requires a boolean condition, not a raw stream.
+      Bad:  detect(A).publish(...)
+      Good: detect(when(A > 0)).publish(...)
+      Bare stream variables are wrapped in when(...> 0) automatically.
+      Already-correct forms like detect(when(...)) are not modified.
+
+    Fix 2 — data() accepts only ONE filter via the named 'filter=' keyword.
+      Bad:  data('metric', filter('k','v'), filter('k2','v2'))
+      Good: data('metric', filter=filter('k','v') and filter('k2','v2'))
+      Multiple positional filter() args cause a "unsupported type for argument
+      rollup" API error because SignalFlow treats the second filter as the
+      rollup positional arg. Lines already using filter= are not modified.
+    """
+    lines = program.splitlines()
+    fixed_lines = []
+
+    for line in lines:
+        # Fix 1: detect(VARNAME) → detect(when(VARNAME > 0))
+        # Matches a bare identifier inside detect() — not when(...), not A > 0
+        line = re.sub(
+            r'\bdetect\(\s*([A-Za-z_]\w*)\s*\)',
+            lambda m: f'detect(when({m.group(1)} > 0))',
+            line,
+        )
+
+        # Fix 2: data('metric', filter(...), filter(...)) → filter=f1 and f2
+        # Only applied when there are 2+ positional filter() calls and no filter= present
+        if re.search(r"\bdata\(", line) and "filter=" not in line:
+            m = re.search(r'\bdata\((.+)\)', line)
+            if m:
+                inner = m.group(1)
+                parts = _split_top_level(inner)
+                filter_parts = []
+                non_filter_parts = []
+                for part in parts:
+                    stripped = part.strip()
+                    if re.match(r"filter\s*\(", stripped):
+                        filter_parts.append(stripped)
+                    else:
+                        non_filter_parts.append(stripped)
+                if len(filter_parts) >= 2:
+                    combined = " and ".join(filter_parts)
+                    new_inner = ", ".join(non_filter_parts + [f"filter={combined}"])
+                    line = line[:m.start()] + f"data({new_inner})" + line[m.end():]
+
+        fixed_lines.append(line)
+
+    return "\n".join(fixed_lines)
+
+
+def _split_top_level(s: str) -> list[str]:
+    """Split string on commas that are not inside parentheses."""
+    parts = []
+    depth = 0
+    current: list[str] = []
+    for ch in s:
+        if ch == '(':
+            depth += 1
+            current.append(ch)
+        elif ch == ')':
+            depth -= 1
+            current.append(ch)
+        elif ch == ',' and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append("".join(current))
+    return parts
+
 
 # ── HTTP Helper ────────────────────────────────────────────────────────────────
 
@@ -114,7 +193,25 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="create_detector",
-            description="Create a new detector with SignalFlow program text and alert rules.",
+            description=(
+                "Create a new detector with SignalFlow program text and alert rules.\n\n"
+                "SignalFlow rules:\n"
+                "  1. detect() requires a boolean condition — use detect(when(A > threshold))\n"
+                "     NOT detect(A). A bare stream variable is not a valid condition.\n"
+                "  2. data() accepts only one filter via the named 'filter=' keyword.\n"
+                "     Combine multiple filters with 'and':\n"
+                "       filter=filter('sf_service','svc') and filter('error','true')\n"
+                "     NOT: data('metric', filter('k','v'), filter('k2','v2'))\n"
+                "  3. filter() with multiple values is an OR across those values:\n"
+                "       filter('sf_service', 'svc-a', 'svc-b', 'svc-c')\n\n"
+                "Example program:\n"
+                "  f = filter('sf_service', 'my-svc')\n"
+                "  A = data('spans.count', filter=f).sum(by=['sf_environment']).mean(over='5m')\n"
+                "  B = data('spans.count', filter=f).sum(by=['sf_environment']).mean(over='1h')\n"
+                "  detect(when(A > B * 10)).publish('my-label')\n\n"
+                "Note: common SignalFlow mistakes are auto-corrected by the server before\n"
+                "submission (bare detect(A) and multiple positional filter() args)."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -928,27 +1025,44 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }))
         case "get_detector":
             return splunk_request("GET", f"/v2/detector/{args['detector_id']}")
+
         case "create_detector":
-            # FIX: The Splunk /v2/detector API expects "programText" not "signalFlowText".
-            # The MCP tool schema uses "signalFlowText" as the user-facing parameter name,
-            # so we remap it here before sending the request body to the API.
-            body = {k: v for k, v in {
-                "name":           args.get("name"),
-                "description":    args.get("description"),
-                "programText":    args.get("signalFlowText"),  # ← remapped from signalFlowText
-                "rules":          args.get("rules"),
-                "tags":           args.get("tags"),
-                "teams":          args.get("teams"),
-                "programOptions": args.get("programOptions"),
-            }.items() if v is not None}
+            # "signalFlowText" is the MCP-facing param name; Splunk API requires "programText".
+            # _sanitize_signalflow() auto-fixes bare detect(A) and multiple positional filters.
+            raw_program = args.get("signalFlowText", "")
+            body = {}
+            if args.get("name"):
+                body["name"] = args["name"]
+            if args.get("description"):
+                body["description"] = args["description"]
+            if raw_program:
+                body["programText"] = _sanitize_signalflow(raw_program)  # ← remap + sanitize
+            if args.get("rules"):
+                body["rules"] = args["rules"]
+            if args.get("tags"):
+                body["tags"] = args["tags"]
+            if args.get("teams"):
+                body["teams"] = args["teams"]
+            if args.get("programOptions"):
+                body["programOptions"] = args["programOptions"]
             return splunk_request("POST", "/v2/detector", body)
+
         case "update_detector":
-            detector_id = args.pop("detector_id")
-            # FIX: Same remapping — "signalFlowText" input param → "programText" API field.
-            if "signalFlowText" in args:
-                args["programText"] = args.pop("signalFlowText")
-            return splunk_request("PUT", f"/v2/detector/{detector_id}",
-                                  {k: v for k, v in args.items() if v is not None})
+            detector_id = args["detector_id"]
+            raw_program = args.get("signalFlowText", "")
+            body = {}
+            if args.get("name"):
+                body["name"] = args["name"]
+            if args.get("description"):
+                body["description"] = args["description"]
+            if raw_program:
+                body["programText"] = _sanitize_signalflow(raw_program)  # ← remap + sanitize
+            if args.get("rules"):
+                body["rules"] = args["rules"]
+            if args.get("tags"):
+                body["tags"] = args["tags"]
+            return splunk_request("PUT", f"/v2/detector/{detector_id}", body)
+
         case "delete_detector":
             return splunk_request("DELETE", f"/v2/detector/{args['detector_id']}")
         case "get_detector_incidents":
