@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "splunk-observability": {
+      "command": "/Users/mbui/.local/bin/uv",
+      "args": [
+        "run",
+        "--with",
+        "mcp[cli]",
+        "--script",
+        "/Users/mbui/Documents/o11y-mcp/o11y-mcp/server.py"
+      ],
+      "env": {
+        "SPLUNK_REALM": "us1",
+        "SPLUNK_ACCESS_TOKEN": "Sjrz8gsw4-D9_0FHYc90_Q",
+        "SPLUNK_INGEST_TOKEN": "1gMZutcDJFLpeLF_Ku3Nqw"
+      }
+    }
+  }
+}

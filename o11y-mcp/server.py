@@ -25,7 +25,10 @@ from mcp.server.stdio import stdio_server
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-ACCESS_TOKEN = os.environ.get("SPLUNK_ACCESS_TOKEN")
+ACCESS_TOKEN  = os.environ.get("SPLUNK_ACCESS_TOKEN")
+# SPLUNK_INGEST_TOKEN is required for send_custom_event (ingest.{realm} endpoint).
+# Falls back to ACCESS_TOKEN but will 401 if that token lacks INGEST scope.
+INGEST_TOKEN  = os.environ.get("SPLUNK_INGEST_TOKEN") or ACCESS_TOKEN
 REALM = os.environ.get("SPLUNK_REALM", "us0")
 
 if not ACCESS_TOKEN:
@@ -41,7 +44,7 @@ INGEST_URL = f"https://ingest.{REALM}.signalfx.com"
 
 def _sanitize_signalflow(program: str) -> str:
     """
-    Auto-fix the two most common SignalFlow mistakes before sending to the API.
+    Auto-fix the three most common SignalFlow mistakes before sending to the API.
 
     Fix 1 — detect() requires a boolean condition, not a raw stream.
       Bad:  detect(A).publish(...)
@@ -55,6 +58,11 @@ def _sanitize_signalflow(program: str) -> str:
       Multiple positional filter() args cause a "unsupported type for argument
       rollup" API error because SignalFlow treats the second filter as the
       rollup positional arg. Lines already using filter= are not modified.
+
+    Fix 3 — lasting= is a parameter of when(), not detect().
+      Bad:  detect(when(A > B), lasting='5m')
+      Good: detect(when(A > B, lasting='5m'))
+      The lasting kwarg after the closing when() paren is moved inside when().
     """
     lines = program.splitlines()
     fixed_lines = []
@@ -65,6 +73,14 @@ def _sanitize_signalflow(program: str) -> str:
         line = re.sub(
             r'\bdetect\(\s*([A-Za-z_]\w*)\s*\)',
             lambda m: f'detect(when({m.group(1)} > 0))',
+            line,
+        )
+
+        # Fix 3: detect(when(...), lasting='Xm') → detect(when(..., lasting='Xm'))
+        # Moves a top-level lasting= kwarg on detect() inside the when() call.
+        line = re.sub(
+            r'\bdetect\((when\((.+?)\)),\s*(lasting\s*=\s*[\'"][^\'"]+[\'"])\)',
+            lambda m: f'detect(when({m.group(2)}, {m.group(3)}))',
             line,
         )
 
@@ -120,13 +136,14 @@ def _split_top_level(s: str) -> list[str]:
 def splunk_request(
     method: str,
     path: str,
-    body: dict | None = None,
+    body: dict | list | None = None,
     base_url: str = BASE_URL,
     extra_headers: dict | None = None,
 ) -> Any:
     url = f"{base_url}{path}"
+    token = INGEST_TOKEN if base_url == INGEST_URL else ACCESS_TOKEN
     headers = {
-        "X-SF-Token": ACCESS_TOKEN,
+        "X-SF-Token": token,
         "Content-Type": "application/json",
     }
     if extra_headers:
@@ -1219,7 +1236,8 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 "properties": args.get("properties", {}),
                 "timestamp":  args.get("timestamp", int(time.time() * 1000)),
             }.items() if v is not None}
-            return splunk_request("POST", "/v2/event", event)
+            # ingest.{realm} requires array body and an ingest-scoped token
+            return splunk_request("POST", "/v2/event", [event], base_url=INGEST_URL)
 
         # ── APM Service Topology ──────────────────────────────────────────────
         case "get_service_topology":
