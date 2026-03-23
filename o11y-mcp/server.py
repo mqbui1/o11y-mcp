@@ -402,6 +402,21 @@ async def list_tools() -> list[types.Tool]:
         # CHARTS
         # ════════════════════════════════════════════════════════════════════
         types.Tool(
+            name="create_chart",
+            description="Create a new chart. Specify programText (SignalFlow) and options.type ('TimeSeriesChart', 'SingleValue', 'Heatmap', 'List', 'Event', 'Text'). Optionally include a groupId to add it to a dashboard group, or chartIds in a dashboard update.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "name":        {"type": "string"},
+                    "description": {"type": "string"},
+                    "programText": {"type": "string", "description": "SignalFlow program text"},
+                    "options":     {"type": "object", "description": "Chart visualization options, e.g. {\"type\": \"TimeSeriesChart\", \"defaultPlotType\": \"ColumnChart\", \"time\": {\"type\": \"relative\", \"range\": 86400000}}"},
+                    "tags":        {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["name", "programText"],
+            },
+        ),
+        types.Tool(
             name="get_chart",
             description="Get details of a specific chart.",
             inputSchema={
@@ -1123,6 +1138,13 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             return splunk_request("GET", f"/v2/dashboardgroup/{args['group_id']}")
 
         # ── Charts ────────────────────────────────────────────────────────────
+        case "create_chart":
+            body = {k: v for k, v in {
+                "name": args["name"], "description": args.get("description"),
+                "programText": args["programText"], "options": args.get("options"),
+                "tags": args.get("tags"),
+            }.items() if v is not None}
+            return splunk_request("POST", "/v2/chart", body)
         case "get_chart":
             return splunk_request("GET", f"/v2/chart/{args['chart_id']}")
         case "list_charts_in_dashboard":

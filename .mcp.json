@@ -11,7 +11,7 @@
       ],
       "env": {
         "SPLUNK_REALM": "us1",
-        "SPLUNK_ACCESS_TOKEN": "Z3aQgUHYIBkxbDq8CEHkHA",
+        "SPLUNK_ACCESS_TOKEN": "nygQhwrAZO7KvwaXlEX8oA",
         "SPLUNK_INGEST_TOKEN": "1gMZutcDJFLpeLF_Ku3Nqw"
       }
     }
