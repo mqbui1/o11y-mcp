@@ -426,11 +426,51 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="update_chart",
+            description="Update an existing chart's name, description, programText, or options.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "chart_id":    {"type": "string"},
+                    "name":        {"type": "string"},
+                    "description": {"type": "string"},
+                    "programText": {"type": "string", "description": "SignalFlow program text"},
+                    "options":     {"type": "object", "description": "Chart visualization options"},
+                    "tags":        {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["chart_id"],
+            },
+        ),
+        types.Tool(
+            name="delete_chart",
+            description="Delete a chart by ID.",
+            inputSchema={
+                "type": "object",
+                "properties": {"chart_id": {"type": "string"}},
+                "required": ["chart_id"],
+            },
+        ),
+        types.Tool(
             name="list_charts_in_dashboard",
             description="List all charts in a specific dashboard.",
             inputSchema={
                 "type": "object",
                 "properties": {"dashboard_id": {"type": "string"}},
+                "required": ["dashboard_id"],
+            },
+        ),
+        types.Tool(
+            name="update_dashboard",
+            description="Update an existing dashboard — add/remove charts, change name, description, or tags. Charts are specified as a list of {chartId, row, column, width, height} objects.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "dashboard_id": {"type": "string"},
+                    "name":         {"type": "string"},
+                    "description":  {"type": "string"},
+                    "charts":       {"type": "array", "items": {"type": "object"}, "description": "List of {chartId, row, column, width, height}"},
+                    "tags":         {"type": "array", "items": {"type": "string"}},
+                },
                 "required": ["dashboard_id"],
             },
         ),
@@ -1147,8 +1187,23 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             return splunk_request("POST", "/v2/chart", body)
         case "get_chart":
             return splunk_request("GET", f"/v2/chart/{args['chart_id']}")
+        case "update_chart":
+            body = {k: v for k, v in {
+                "name": args.get("name"), "description": args.get("description"),
+                "programText": args.get("programText"), "options": args.get("options"),
+                "tags": args.get("tags"),
+            }.items() if v is not None}
+            return splunk_request("PUT", f"/v2/chart/{args['chart_id']}", body)
+        case "delete_chart":
+            return splunk_request("DELETE", f"/v2/chart/{args['chart_id']}")
         case "list_charts_in_dashboard":
             return splunk_request("GET", f"/v2/dashboard/{args['dashboard_id']}/chart")
+        case "update_dashboard":
+            body = {k: v for k, v in {
+                "name": args.get("name"), "description": args.get("description"),
+                "charts": args.get("charts"), "tags": args.get("tags"),
+            }.items() if v is not None}
+            return splunk_request("PUT", f"/v2/dashboard/{args['dashboard_id']}", body)
 
         # ── Metrics ───────────────────────────────────────────────────────────
         case "search_metrics":
