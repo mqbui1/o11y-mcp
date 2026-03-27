@@ -461,7 +461,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="update_dashboard",
-            description="Update an existing dashboard — add/remove charts, change name, description, or tags. Charts are specified as a list of {chartId, row, column, width, height} objects.",
+            description="Update an existing dashboard — add/remove charts, change name, description, or tags. Charts are specified as a list of {chartId, row, column, width, height} objects. groupId is fetched automatically from the existing dashboard.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -908,7 +908,7 @@ async def list_tools() -> list[types.Tool]:
                     },
                     "minDurationMs": {
                         "type": "integer",
-                        "description": "Only return traces longer than this duration (ms)",
+                        "description": "Only return traces longer than this duration (ms). Note: not enforced server-side, filter client-side.",
                     },
                     "maxDurationMs": {
                         "type": "integer",
@@ -1197,12 +1197,21 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
         case "delete_chart":
             return splunk_request("DELETE", f"/v2/chart/{args['chart_id']}")
         case "list_charts_in_dashboard":
-            return splunk_request("GET", f"/v2/dashboard/{args['dashboard_id']}/chart")
+            # The /v2/dashboard/{id}/chart endpoint doesn't exist — fetch the
+            # dashboard and return its charts array instead.
+            dash = splunk_request("GET", f"/v2/dashboard/{args['dashboard_id']}")
+            return {"charts": dash.get("charts", []), "dashboard_id": args["dashboard_id"]}
         case "update_dashboard":
-            body = {k: v for k, v in {
-                "name": args.get("name"), "description": args.get("description"),
-                "charts": args.get("charts"), "tags": args.get("tags"),
-            }.items() if v is not None}
+            # PUT requires groupId — fetch it from the existing dashboard first.
+            existing = splunk_request("GET", f"/v2/dashboard/{args['dashboard_id']}")
+            body = {"groupId": existing["groupId"]}
+            for k in ("name", "description", "charts", "tags"):
+                if args.get(k) is not None:
+                    body[k] = args[k]
+            # Preserve existing values for fields not being updated
+            for k in ("name", "description", "charts", "tags"):
+                if k not in body:
+                    body[k] = existing.get(k)
             return splunk_request("PUT", f"/v2/dashboard/{args['dashboard_id']}", body)
 
         # ── Metrics ───────────────────────────────────────────────────────────
@@ -1452,16 +1461,10 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                     "filterType": "traceFilter",
                 })
 
-            duration_filter = {}
-            if args.get("minDurationMs"):
-                duration_filter["gte"] = args["minDurationMs"]
-            if args.get("maxDurationMs"):
-                duration_filter["lte"] = args["maxDurationMs"]
-            if duration_filter:
-                trace_filters.append({
-                    "durationFilter": {"durationMillis": duration_filter},
-                    "filterType": "durationFilter",
-                })
+            # Note: minDurationMs/maxDurationMs are not supported as filter
+            # types by the trace analytics API (durationFilter is not a valid
+            # filterType). These parameters are accepted but ignored to avoid
+            # breaking callers — filter by duration client-side if needed.
 
             parameters = {
                 "sharedParameters": {
