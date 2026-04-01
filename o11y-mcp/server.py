@@ -351,12 +351,13 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="create_dashboard",
-            description="Create a new dashboard.",
+            description="Create a new dashboard. Provide group_id to add it to an existing dashboard group (strongly recommended — Splunk requires a group). If group_id is omitted, a new group is auto-created with the same name.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "name":        {"type": "string"},
                     "description": {"type": "string"},
+                    "group_id":    {"type": "string", "description": "Dashboard group ID to add the dashboard to. Use list_dashboard_groups to find one."},
                     "charts":      {"type": "array", "items": {"type": "object"}},
                     "tags":        {"type": "array", "items": {"type": "string"}},
                 },
@@ -752,16 +753,16 @@ async def list_tools() -> list[types.Tool]:
         # ════════════════════════════════════════════════════════════════════
         types.Tool(
             name="search_events",
-            description="Search for events by time range and optional filters.",
+            description="Search for events by eventType and time range. query must be the exact eventType string (e.g. 'deployment.started', 'anomaly.detected').",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query":     {"type": "string",  "description": "Search query to filter events"},
+                    "query":     {"type": "string",  "description": "eventType to search for (required). e.g. 'deployment.started'"},
                     "startTime": {"type": "integer", "description": "Start time in ms since epoch"},
                     "endTime":   {"type": "integer", "description": "End time in ms since epoch"},
                     "limit":     {"type": "integer", "description": "Max results (default 100)"},
-                    "offset":    {"type": "integer"},
                 },
+                "required": ["query"],
             },
         ),
         types.Tool(
@@ -1160,8 +1161,14 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
         case "get_dashboard":
             return splunk_request("GET", f"/v2/dashboard/{args['dashboard_id']}")
         case "create_dashboard":
+            group_id = args.get("group_id")
+            if not group_id:
+                # Splunk requires a groupId — auto-create a group with the same name
+                grp = splunk_request("POST", "/v2/dashboardgroup", {"name": args["name"]})
+                group_id = grp.get("id")
             body = {k: v for k, v in {
                 "name": args.get("name"), "description": args.get("description"),
+                "groupId": group_id,
                 "charts": args.get("charts", []), "tags": args.get("tags"),
             }.items() if v is not None}
             return splunk_request("POST", "/v2/dashboard", body)
@@ -1216,8 +1223,13 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         # ── Metrics ───────────────────────────────────────────────────────────
         case "search_metrics":
+            q = args["query"]
+            # API requires Lucene field:value syntax — bare names like "cpu" fail with 400.
+            # Auto-prefix with sf_metric: if no field qualifier is present.
+            if ":" not in q:
+                q = f"sf_metric:{q}*"
             return splunk_request("GET", "/v2/metric" + qs({
-                "query": args["query"], "limit": args.get("limit"), "offset": args.get("offset"),
+                "query": q, "limit": args.get("limit"), "offset": args.get("offset"),
             }))
         case "get_metric_metadata":
             return splunk_request("GET", f"/v2/metric/{urllib.parse.quote(args['metric_name'], safe='')}")
@@ -1274,7 +1286,7 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
         case "get_organization":
             return splunk_request("GET", "/v2/organization")
         case "list_org_tokens":
-            return splunk_request("GET", "/v2/organization/token" + qs({
+            return splunk_request("GET", "/v2/token" + qs({
                 "limit": args.get("limit"), "offset": args.get("offset"),
             }))
 
@@ -1305,15 +1317,40 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         # ── Events ────────────────────────────────────────────────────────────
         case "search_events":
-            return splunk_request("GET", "/v2/event" + qs({
-                "query":     args.get("query"),
-                "startTime": args.get("startTime"),
-                "endTime":   args.get("endTime"),
-                "limit":     args.get("limit"),
-                "offset":    args.get("offset"),
-            }))
+            # /v2/event GET returns 404 — use SignalFlow events() instead.
+            # events() requires eventType — query must be provided.
+            now_ms = int(time.time() * 1000)
+            start_ms = args.get("startTime", now_ms - 3_600_000)
+            stop_ms  = args.get("endTime",   now_ms)
+            limit    = args.get("limit", 100)
+            q        = args.get("query", "")
+            if not q:
+                return {"count": 0, "results": [], "note": "query (eventType) is required for search_events. Example: query='deployment.started'"}
+            program = f"events(eventType='{q}').publish()"
+            query_params = {"start": start_ms, "stop": stop_ms, "immediate": "true"}
+            url = f"{STREAM_URL}/v2/signalflow/execute" + qs(query_params)
+            headers = {"X-SF-Token": ACCESS_TOKEN, "Content-Type": "text/plain"}
+            req = urllib.request.Request(url, data=program.encode(), headers=headers, method="POST")
+            event_results = []
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    raw_body = resp.read().decode("utf-8")
+                for chunk in raw_body.strip().split("\n\n"):
+                    lines = [l[5:] for l in chunk.splitlines() if l.startswith("data:")]
+                    payload = "".join(lines).strip()
+                    if not payload:
+                        continue
+                    try:
+                        msg = json.loads(payload)
+                        if msg.get("type") == "event":
+                            event_results.append(msg)
+                    except json.JSONDecodeError:
+                        pass
+            except urllib.error.HTTPError as e:
+                raise RuntimeError(f"Splunk API error {e.code}: {e.read().decode()}")
+            return {"count": len(event_results[:limit]), "results": event_results[:limit]}
         case "get_event":
-            return splunk_request("GET", f"/v2/event/{args['event_id']}")
+            return {"error": "get_event is not supported: Splunk Observability has no REST GET /v2/event/{id} endpoint. Use search_events with the eventType as query, or execute_signalflow with events(eventType='...').publish()."}
         case "send_custom_event":
             event = {k: v for k, v in {
                 "eventType":  args["eventType"],
@@ -1382,12 +1419,13 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         case "get_trace_analysis":
             trace_id = args["trace_id"]
+            # Note: TraceSpan does NOT have a parentSpanID field — omitted.
             query = (
                 "query TraceAnalysis($id: ID!) {"
                 " trace(id: $id) {"
                 " traceID startTime duration"
                 " spans {"
-                "   spanID operationName serviceName parentSpanID"
+                "   spanID operationName serviceName"
                 "   startTime duration"
                 "   tags { key value }"
                 " } } }"
@@ -1507,7 +1545,7 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 ),
             }
             examples = []
-            for attempt in range(10):
+            for _ in range(10):
                 poll_result = splunk_request(
                     "POST", "/v2/apm/graphql?op=GetAnalyticsSearch",
                     get_body, base_url=APP_URL,
@@ -1646,11 +1684,13 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
         case "get_service_map_for_trace":
             trace_id = args["trace_id"]
+            # Note: TraceSpan does NOT have a parentSpanID field.
+            # Infer parent-child edges by timing containment instead.
             query = (
                 "query TraceServiceMap($id: ID!) {"
                 " trace(id: $id) {"
                 " traceID"
-                " spans { spanID operationName serviceName parentSpanID startTime duration } } }"
+                " spans { spanID operationName serviceName startTime duration } } }"
             )
             gql_body = {
                 "operationName": "TraceServiceMap",
@@ -1664,15 +1704,27 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 base_url=APP_URL,
             )
             spans = (result.get("data", {}).get("trace") or {}).get("spans", [])
-            span_map = {s["spanID"]: s for s in spans}
+            # Infer edges: span A is parent of span B if B's window is contained within A's
+            # and A has the shortest duration among all containing spans (immediate parent).
             edges = set()
-            for span in spans:
-                parent_id = span.get("parentSpanID")
-                if parent_id and parent_id in span_map:
-                    parent_svc = span_map[parent_id].get("serviceName")
-                    child_svc = span.get("serviceName")
-                    if parent_svc and child_svc and parent_svc != child_svc:
-                        edges.add((parent_svc, child_svc))
+            for i, child in enumerate(spans):
+                c_start = child.get("startTime", 0)
+                c_end   = c_start + child.get("duration", 0)
+                best_parent = None
+                best_dur    = float("inf")
+                for j, candidate in enumerate(spans):
+                    if i == j:
+                        continue
+                    p_start = candidate.get("startTime", 0)
+                    p_end   = p_start + candidate.get("duration", 0)
+                    if p_start <= c_start and p_end >= c_end and candidate.get("duration", 0) < best_dur:
+                        best_parent = candidate
+                        best_dur    = candidate.get("duration", 0)
+                if best_parent:
+                    p_svc = best_parent.get("serviceName")
+                    c_svc = child.get("serviceName")
+                    if p_svc and c_svc and p_svc != c_svc:
+                        edges.add((p_svc, c_svc))
             services = list({s.get("serviceName") for s in spans if s.get("serviceName")})
             return {
                 "traceID": trace_id,
