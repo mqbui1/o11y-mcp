@@ -1754,7 +1754,8 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 "stop":       args.get("stop", now_ms),
                 "resolution": args.get("resolution"),
                 "maxDelay":   args.get("maxDelay"),
-                "immediate":  str(args.get("immediate", True)).lower(),
+                # Only send when caller sets it; avoids forcing immediate=true semantics.
+                **({"immediate": str(args["immediate"]).lower()} if "immediate" in args else {}),
             }.items() if v is not None}
             url = f"{STREAM_URL}/v2/signalflow/execute" + qs(query_params)
             headers = {
@@ -1763,52 +1764,85 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }
             encoded = args["program"].encode("utf-8")
             req = urllib.request.Request(url, data=encoded, headers=headers, method="POST")
-            messages = []
-            data_points = []
-            metadata = {}
+            messages: list = []
+            data_points: list = []
+            metadata: dict = {}
+            def iter_sse_events(body: str):
+                """
+                Parse Splunk SignalFlow SSE: each event is a block of lines separated by a blank line.
+                Message kind is on the optional 'event:' line; payload is one or more 'data:' lines.
+                See: https://dev.splunk.com/observability/reference/api/signalflow/latest/
+                """
+                block_lines: list[str] = []
+                for line in body.splitlines():
+                    if line == "":
+                        if block_lines:
+                            yield _parse_one_sse_block(block_lines)
+                            block_lines = []
+                    else:
+                        block_lines.append(line)
+                if block_lines:
+                    yield _parse_one_sse_block(block_lines)
+            def _parse_one_sse_block(lines: list[str]) -> tuple[str, dict]:
+                # Default per HTML5 SSE when 'event:' is omitted
+                event_name = "message"
+                data_parts: list[str] = []
+                for raw in lines:
+                    if raw.startswith(":"):
+                        continue  # comment / heartbeat
+                    if raw.startswith("event:"):
+                        event_name = raw[6:].strip() or "message"
+                    elif raw.startswith("data:"):
+                        data_parts.append(raw[5:].lstrip())
+                payload = "\n".join(data_parts).strip()
+                if not payload:
+                    return event_name, {}
+                try:
+                    return event_name, json.loads(payload)
+                except json.JSONDecodeError as e:
+                    messages.append({"type": "parse_error", "event": event_name, "error": str(e), "payload_preview": payload[:500]})
+                    return event_name, {}
             try:
                 with urllib.request.urlopen(req) as resp:
                     raw_body = resp.read().decode("utf-8")
-
-                events = raw_body.strip().split("\n\n")
-                for event in events:
-                    lines = [l[5:] if l.startswith("data:") else l
-                             for l in event.splitlines()
-                             if l.startswith("data:") or (l and not l.startswith(":"))]
-                    payload = "".join(lines).strip()
-                    if not payload:
+                for sse_event, msg in iter_sse_events(raw_body):
+                    if not msg and sse_event != "error":
                         continue
-                    try:
-                        msg = json.loads(payload)
-                        event_type = msg.get("type") or msg.get("event")
-                        if event_type == "data":
-                            for point in msg.get("data", []):
-                                if point.get("value") is not None:
-                                    data_points.append({
-                                        "tsId":        point.get("tsId"),
-                                        "value":       point.get("value"),
-                                        "timestampMs": msg.get("logicalTimestampMs"),
-                                    })
-                        elif event_type == "metadata":
-                            tsid = msg.get("tsId")
-                            if tsid:
-                                metadata[tsid] = msg.get("properties", {})
-                        elif event_type in ("done", "error"):
-                            messages.append(msg)
+                    if sse_event == "data":
+                        ts_ms = msg.get("logicalTimestampMs")
+                        for point in msg.get("data") or []:
+                            tsid = point.get("tsId")
+                            if tsid is None:
+                                continue
+                            val = point.get("value")
+                            if val is None:
+                                continue
+                            data_points.append({
+                                "tsId": tsid,
+                                "value": val,
+                                "timestampMs": ts_ms,
+                            })
+                    elif sse_event == "metadata":
+                        tsid = msg.get("tsId")
+                        if tsid:
+                            metadata[tsid] = msg.get("properties", {})
+                    elif sse_event == "error":
+                        messages.append(msg)
+                        break
+                    elif sse_event == "control-message":
+                        messages.append(msg)
+                        inner = msg.get("event")
+                        if inner in ("END_OF_CHANNEL", "CHANNEL_ABORT"):
                             break
-                        else:
-                            messages.append(msg)
-                    except json.JSONDecodeError:
-                        pass
-
+                    else:
+                        # message, event, expired-tsid, etc.
+                        messages.append({"sseEvent": sse_event, **msg} if msg else {"sseEvent": sse_event})
             except urllib.error.HTTPError as e:
                 raise RuntimeError(f"Splunk API error {e.code}: {e.read().decode()}")
-
             enriched = []
             for pt in data_points:
                 meta = metadata.get(pt["tsId"], {})
                 enriched.append({**pt, "properties": meta})
-
             return {
                 "dataPoints": enriched,
                 "dataPointCount": len(enriched),
