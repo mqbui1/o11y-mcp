@@ -1057,6 +1057,34 @@ async def list_tools() -> list[types.Tool]:
         ),
 
         # ════════════════════════════════════════════════════════════════════
+        # MTS SUMMARY
+        # ════════════════════════════════════════════════════════════════════
+        types.Tool(
+            name="get_mts_summary",
+            description=(
+                "Summarize all metric time series (MTS) in the org, broken down by "
+                "deployment.environment (sf_environment) and service (sf_service). "
+                "Includes both active and inactive/archived MTS from the catalog. "
+                "Optionally filter to specific metrics. Defaults to core APM metrics: "
+                "service.request.count, service.request.duration.ns.p99, spans.count."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "metrics": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Metric names to summarize. Defaults to core APM metrics if omitted.",
+                    },
+                    "include_inactive": {
+                        "type": "boolean",
+                        "description": "Include inactive MTS (default: true)",
+                    },
+                },
+            },
+        ),
+
+        # ════════════════════════════════════════════════════════════════════
         # SIGNALFLOW
         # ════════════════════════════════════════════════════════════════════
         types.Tool(
@@ -1768,6 +1796,104 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                     for s in args["services"]
                 ]
             return splunk_request("POST", "/v2/apm/topology", body)
+
+        # ── MTS Summary ───────────────────────────────────────────────────────
+        case "get_mts_summary":
+            DEFAULT_METRICS = [
+                "service.request.count",
+                "service.request.duration.ns.p99",
+                "service.request.duration.ns.p90",
+                "service.request.duration.ns.median",
+                "spans.count",
+            ]
+            metrics = args.get("metrics") or DEFAULT_METRICS
+            include_inactive = args.get("include_inactive", True)
+
+            # Collect all MTS from the catalog for each metric
+            from collections import defaultdict
+            # env -> svc -> {metric -> {active, inactive}}
+            summary: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: {"active": 0, "inactive": 0})))
+            seen_ids: set = set()
+            metric_totals: dict = defaultdict(lambda: {"active": 0, "inactive": 0, "envs": set()})
+
+            for metric in metrics:
+                offset = 0
+                while True:
+                    resp = splunk_request("GET", "/v2/metrictimeseries" + qs({
+                        "query": f"sf_metric:{metric}",
+                        "limit": 100,
+                        "offset": offset,
+                    }))
+                    results = resp.get("results", [])
+                    if not results:
+                        break
+                    new_results = [r for r in results if r["id"] not in seen_ids]
+                    if not new_results and offset > 0:
+                        break  # API not paginating — stop
+                    for r in new_results:
+                        seen_ids.add(r["id"])
+                        is_active = bool(r.get("active"))
+                        if not include_inactive and not is_active:
+                            continue
+                        env = r.get("dimensions", {}).get("sf_environment") or "unknown"
+                        svc = r.get("dimensions", {}).get("sf_service") or "(none)"
+                        state = "active" if is_active else "inactive"
+                        summary[env][svc][metric][state] += 1
+                        metric_totals[metric][state] += 1
+                        metric_totals[metric]["envs"].add(env)
+                    # If we got fewer results than requested, we're done
+                    if len(results) < 100:
+                        break
+                    offset += len(results)
+
+            # Build output
+            env_rows = []
+            for env in sorted(summary):
+                svc_rows = []
+                env_active = env_inactive = 0
+                for svc in sorted(summary[env]):
+                    svc_active = sum(v["active"] for v in summary[env][svc].values())
+                    svc_inactive = sum(v["inactive"] for v in summary[env][svc].values())
+                    env_active += svc_active
+                    env_inactive += svc_inactive
+                    svc_rows.append({
+                        "service": svc,
+                        "active_mts": svc_active,
+                        "inactive_mts": svc_inactive,
+                        "total_mts": svc_active + svc_inactive,
+                        "by_metric": {
+                            m: summary[env][svc][m]
+                            for m in metrics if m in summary[env][svc]
+                        },
+                    })
+                env_rows.append({
+                    "environment": env,
+                    "active_mts": env_active,
+                    "inactive_mts": env_inactive,
+                    "total_mts": env_active + env_inactive,
+                    "services": svc_rows,
+                })
+
+            metric_summary = {
+                m: {
+                    "active": metric_totals[m]["active"],
+                    "inactive": metric_totals[m]["inactive"],
+                    "total": metric_totals[m]["active"] + metric_totals[m]["inactive"],
+                    "environments": sorted(metric_totals[m]["envs"]),
+                }
+                for m in metrics if m in metric_totals
+            }
+
+            total_active = sum(e["active_mts"] for e in env_rows)
+            total_inactive = sum(e["inactive_mts"] for e in env_rows)
+            return {
+                "total_active_mts": total_active,
+                "total_inactive_mts": total_inactive,
+                "total_mts": total_active + total_inactive,
+                "metrics_queried": metrics,
+                "by_environment": env_rows,
+                "by_metric": metric_summary,
+            }
 
         # ── SignalFlow ────────────────────────────────────────────────────────
         case "execute_signalflow":
