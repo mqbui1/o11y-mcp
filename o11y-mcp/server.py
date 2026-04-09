@@ -505,11 +505,17 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="search_metric_time_series",
-            description="Search for metric time series (MTS) matching a query.",
+            description=(
+                "Search for metric time series (MTS) matching a query. "
+                "NOTE: Only sf_metric and sf_type are reliably indexed for Lucene filtering. "
+                "Dimension filters like sf_environment or host do NOT work reliably in the query string — "
+                "use search_dimensions or execute_signalflow with a filter() instead. "
+                "Example: 'sf_metric:cpu.utilization'"
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query":  {"type": "string", "description": "e.g. 'sf_metric:cpu.utilization AND host:web-01'"},
+                    "query":  {"type": "string", "description": "Lucene query — use sf_metric:<name> for reliable results. e.g. 'sf_metric:cpu.utilization'"},
                     "limit":  {"type": "integer"},
                     "offset": {"type": "integer"},
                 },
@@ -1215,10 +1221,16 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             for k in ("name", "description", "charts", "tags"):
                 if args.get(k) is not None:
                     body[k] = args[k]
-            # Preserve existing values for fields not being updated
-            for k in ("name", "description", "charts", "tags"):
-                if k not in body:
-                    body[k] = existing.get(k)
+            # Fix 6: preserve all existing fields not being updated, including
+            # chart layout fields (chartDensity, filtersBar, eventOverlays, etc.)
+            preserve_keys = (
+                "name", "description", "charts", "tags",
+                "chartDensity", "filtersBar", "filters",
+                "eventOverlays", "selectedEventOverlays",
+            )
+            for k in preserve_keys:
+                if k not in body and existing.get(k) is not None:
+                    body[k] = existing[k]
             return splunk_request("PUT", f"/v2/dashboard/{args['dashboard_id']}", body)
 
         # ── Metrics ───────────────────────────────────────────────────────────
@@ -1544,8 +1556,9 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                     "}\n"
                 ),
             }
+            # Fix 5: increase poll attempts and interval for slow queries
             examples = []
-            for _ in range(10):
+            for _ in range(20):
                 poll_result = splunk_request(
                     "POST", "/v2/apm/graphql?op=GetAnalyticsSearch",
                     get_body, base_url=APP_URL,
@@ -1613,10 +1626,12 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
             svc_filter = ""
             if args.get("services"):
-                svc_filter = f", filter=filter('sf_service', '{args['services'][0]}')"
+                # Fix 4: include all services, not just the first
+                svc_values = ", ".join(f"'{s}'" for s in args["services"])
+                svc_filter = f", filter=filter('sf_service', {svc_values})"
             if args.get("operations"):
-                op = args["operations"][0]
-                svc_filter += f".filter(filter('sf_operation', '{op}'))"
+                op_values = ", ".join(f"'{o}'" for o in args["operations"])
+                svc_filter += f".filter(filter('sf_operation', {op_values}))"
 
             program = (
                 f"data('service.request.duration.ns.p99'{svc_filter})"
@@ -1749,12 +1764,22 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
         # ── SignalFlow ────────────────────────────────────────────────────────
         case "execute_signalflow":
             now_ms = int(time.time() * 1000)
+            # Fix 1: treat negative start/stop as relative offsets from now
+            raw_start = args.get("start", now_ms - 3_600_000)
+            raw_stop  = args.get("stop")
+            start_ms  = now_ms + raw_start if raw_start is not None and raw_start < 0 else raw_start
+            stop_ms   = now_ms + raw_stop  if raw_stop  is not None and raw_stop  < 0 else raw_stop
+            if stop_ms is None:
+                stop_ms = now_ms
+            # Fix 3: only set immediate=true when no explicit stop was given
+            explicit_stop = args.get("stop") is not None
+            default_immediate = not explicit_stop
             query_params = {k: v for k, v in {
-                "start":      args.get("start", now_ms - 3_600_000),
-                "stop":       args.get("stop", now_ms),
+                "start":      start_ms,
+                "stop":       stop_ms,
                 "resolution": args.get("resolution"),
                 "maxDelay":   args.get("maxDelay"),
-                "immediate":  str(args.get("immediate", True)).lower(),
+                "immediate":  str(args.get("immediate", default_immediate)).lower(),
             }.items() if v is not None}
             url = f"{STREAM_URL}/v2/signalflow/execute" + qs(query_params)
             headers = {
