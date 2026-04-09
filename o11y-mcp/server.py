@@ -1348,13 +1348,18 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                 with urllib.request.urlopen(req) as resp:
                     raw_body = resp.read().decode("utf-8")
                 for chunk in raw_body.strip().split("\n\n"):
+                    sse_type = None
+                    for l in chunk.splitlines():
+                        if l.startswith("event:"):
+                            sse_type = l[6:].strip()
+                            break
                     lines = [l[5:] for l in chunk.splitlines() if l.startswith("data:")]
                     payload = "".join(lines).strip()
                     if not payload:
                         continue
                     try:
                         msg = json.loads(payload)
-                        if msg.get("type") == "event":
+                        if sse_type == "event":
                             event_results.append(msg)
                     except json.JSONDecodeError:
                         pass
@@ -1654,15 +1659,18 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                     raw_body = resp.read().decode("utf-8")
                 events = raw_body.strip().split("\n\n")
                 for event in events:
-                    lines = [l[5:] if l.startswith("data:") else l
-                             for l in event.splitlines()
-                             if l.startswith("data:")]
+                    event_type = None
+                    for l in event.splitlines():
+                        if l.startswith("event:"):
+                            event_type = l[6:].strip()
+                            break
+                    lines = [l[5:] for l in event.splitlines() if l.startswith("data:")]
                     payload = "".join(lines).strip()
                     if not payload:
                         continue
                     try:
                         msg = json.loads(payload)
-                        if msg.get("type") == "data":
+                        if event_type == "data":
                             for pt in msg.get("data", []):
                                 if pt.get("value") is not None:
                                     data_points.append({
@@ -1670,7 +1678,7 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
                                         "value": pt.get("value"),
                                         "timestampMs": msg.get("logicalTimestampMs"),
                                     })
-                        elif msg.get("type") == "metadata":
+                        elif event_type == "metadata":
                             metadata[msg.get("tsId")] = msg.get("properties", {})
                     except json.JSONDecodeError:
                         pass
@@ -1797,15 +1805,17 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
 
                 events = raw_body.strip().split("\n\n")
                 for event in events:
-                    lines = [l[5:] if l.startswith("data:") else l
-                             for l in event.splitlines()
-                             if l.startswith("data:") or (l and not l.startswith(":"))]
+                    event_type = None
+                    for l in event.splitlines():
+                        if l.startswith("event:"):
+                            event_type = l[6:].strip()
+                            break
+                    lines = [l[5:] for l in event.splitlines() if l.startswith("data:")]
                     payload = "".join(lines).strip()
                     if not payload:
                         continue
                     try:
                         msg = json.loads(payload)
-                        event_type = msg.get("type") or msg.get("event")
                         if event_type == "data":
                             for point in msg.get("data", []):
                                 if point.get("value") is not None:
