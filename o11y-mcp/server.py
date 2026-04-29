@@ -1088,6 +1088,46 @@ async def list_tools() -> list[types.Tool]:
         # SIGNALFLOW
         # ════════════════════════════════════════════════════════════════════
         types.Tool(
+            name="generate_signalflow_program",
+            description=(
+                "Translate a natural language question into a valid SignalFlow program string "
+                "ready to pass to execute_signalflow.\n\n"
+                "SignalFlow syntax reference:\n"
+                "  data('metric.name', filter=filter('dim','val')).mean().publish()\n"
+                "  data('spans.count', filter=filter('sf_environment','prod') and filter('sf_service','api')).sum().publish()\n"
+                "  data('service.request.duration.ns.p99', filter=filter('sf_service','checkout')).mean().publish()\n"
+                "  events(eventType='anomaly.detected', filter=filter('sf_environment','prod')).publish()\n\n"
+                "Common APM metrics:\n"
+                "  spans.count                          — request/span throughput\n"
+                "  service.request.duration.ns.p99      — p99 latency (nanoseconds)\n"
+                "  service.request.duration.ns.p50      — median latency\n"
+                "  service.request.count                — request count\n\n"
+                "Common infra metrics:\n"
+                "  cpu.utilization                      — host CPU %\n"
+                "  memory.utilization                   — host memory %\n\n"
+                "Common dimensions: sf_service, sf_environment, sf_operation, host, kubernetes_cluster\n\n"
+                "Returns a SignalFlow program string — pass it directly to execute_signalflow."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Natural language description of the metric query, e.g. 'p99 latency for the checkout service in production over the last hour'",
+                    },
+                    "environment": {
+                        "type": "string",
+                        "description": "Optional sf_environment value to filter on (e.g. 'production')",
+                    },
+                    "service": {
+                        "type": "string",
+                        "description": "Optional sf_service value to filter on",
+                    },
+                },
+                "required": ["question"],
+            },
+        ),
+        types.Tool(
             name="execute_signalflow",
             description=(
                 "Execute a SignalFlow program and get results. "
@@ -1896,6 +1936,65 @@ def handle_tool(name: str, args: dict) -> Any:  # noqa: C901
             }
 
         # ── SignalFlow ────────────────────────────────────────────────────────
+        case "generate_signalflow_program":
+            question = args["question"].lower()
+            env = args.get("environment", "")
+            svc = args.get("service", "")
+
+            # Build filter string from optional env/service hints
+            filters = []
+            if env:
+                filters.append(f"filter('sf_environment', '{env}')")
+            if svc:
+                filters.append(f"filter('sf_service', '{svc}')")
+            filter_str = (" and ".join(filters)) if filters else ""
+            filter_clause = f", filter={filter_str}" if filter_str else ""
+
+            # Map natural language intent to SignalFlow program
+            if any(w in question for w in ("error rate", "error %", "errors")):
+                metric = "spans.count"
+                error_filter = f"filter('sf_error', 'true')"
+                total_filter = filter_str
+                ef = (f"filter={filter_str} and {error_filter}" if filter_str else f"filter={error_filter}")
+                tf = (f"filter={total_filter}" if total_filter else "")
+                program = (
+                    f"errors = data('{metric}', {ef}).sum()\n"
+                    f"total  = data('{metric}'{', ' + tf if tf else ''}).sum()\n"
+                    f"(errors / total * 100).publish(label='error_rate_pct')"
+                )
+            elif any(w in question for w in ("p99", "99th", "latency", "duration", "slow")):
+                metric = "service.request.duration.ns.p99"
+                program = f"data('{metric}'{filter_clause}).mean().publish(label='p99_latency_ns')"
+            elif any(w in question for w in ("p50", "median", "p90", "90th")):
+                pct = "p50" if any(w in question for w in ("p50", "median")) else "p90"
+                metric = f"service.request.duration.ns.{pct}"
+                program = f"data('{metric}'{filter_clause}).mean().publish(label='{pct}_latency_ns')"
+            elif any(w in question for w in ("throughput", "request", "rps", "rpm", "requests per")):
+                metric = "spans.count"
+                program = f"data('{metric}'{filter_clause}).sum().publish(label='requests')"
+            elif any(w in question for w in ("cpu",)):
+                metric = "cpu.utilization"
+                program = f"data('{metric}'{filter_clause}).mean().publish(label='cpu_utilization')"
+            elif any(w in question for w in ("memory", "mem",)):
+                metric = "memory.utilization"
+                program = f"data('{metric}'{filter_clause}).mean().publish(label='memory_utilization')"
+            elif any(w in question for w in ("event",)):
+                event_type = "custom.event"
+                program = f"events(eventType='{event_type}'{filter_clause}).publish()"
+            else:
+                # Generic spans.count fallback
+                metric = "spans.count"
+                program = f"data('{metric}'{filter_clause}).sum().publish()"
+
+            return {
+                "program": program,
+                "note": (
+                    "Generated from natural language. Review the program before executing — "
+                    "adjust metric name, filters, or aggregation as needed. "
+                    "Pass to execute_signalflow to run."
+                ),
+            }
+
         case "execute_signalflow":
             now_ms = int(time.time() * 1000)
             # Fix 1: treat negative start/stop as relative offsets from now
