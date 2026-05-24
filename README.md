@@ -70,7 +70,7 @@ Add to your `claude_desktop_config.json`:
         "run",
         "--with", "mcp[cli]",
         "--script",
-        "/absolute/path/to/o11y-mcp/o11y-mcp/server.py"
+        "/absolute/path/to/o11y-mcp/server.py"
       ],
       "env": {
         "SPLUNK_ACCESS_TOKEN": "your-access-token",
@@ -90,7 +90,7 @@ pip install mcp
   "mcpServers": {
     "splunk-observability": {
       "command": "python3",
-      "args": ["/absolute/path/to/o11y-mcp/o11y-mcp/server.py"],
+      "args": ["/absolute/path/to/o11y-mcp/server.py"],
       "env": {
         "SPLUNK_ACCESS_TOKEN": "your-access-token",
         "SPLUNK_REALM": "us1"
@@ -159,8 +159,7 @@ Find the slowest traces in the last hour and analyze what's causing the latency
 
 ```
 o11y-mcp/
-└── o11y-mcp/
-    ├── server.py                  # MCP server — all tools defined here
-    ├── requirements.txt           # mcp>=1.0.0
-    └── claude_desktop_config.json # Example config (tokens redacted)
+├── server.py                  # MCP server — all tools defined here
+├── requirements.txt           # mcp>=1.0.0
+└── claude_desktop_config.json # Example config (tokens redacted)
 ```
