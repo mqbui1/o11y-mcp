@@ -7,12 +7,12 @@
         "--with",
         "mcp[cli]",
         "--script",
-        "/Users/mbui/Documents/o11y-mcp/o11y-mcp/server.py"
+        "/Users/mbui/Documents/o11y-mcp/server.py"
       ],
       "env": {
         "SPLUNK_REALM": "us1",
-        "SPLUNK_ACCESS_TOKEN": "<your-api-token>",
-        "SPLUNK_INGEST_TOKEN": "<your-ingest-token>"
+        "SPLUNK_ACCESS_TOKEN": "your-access-token-here",
+        "SPLUNK_INGEST_TOKEN": "your-ingest-token-here"
       }
     }
   }

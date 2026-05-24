@@ -152,17 +152,26 @@ def splunk_request(
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
 
-    try:
-        with urllib.request.urlopen(req) as resp:
-            raw = resp.read().decode()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode()
+    last_err: Exception | None = None
+    for attempt in range(3):
         try:
-            detail = json.loads(raw)
-        except Exception:
-            detail = raw
-        raise RuntimeError(f"Splunk API error {e.code}: {json.dumps(detail)}")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                raw = resp.read().decode()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < 2:
+                import time
+                time.sleep(2 ** attempt)
+                last_err = e
+                continue
+            raw = e.read().decode()
+            try:
+                detail = json.loads(raw)
+            except Exception:
+                detail = raw
+            raise RuntimeError(f"Splunk API error {e.code}: {json.dumps(detail)}")
+    assert last_err is not None
+    raise RuntimeError(f"Splunk API request failed after retries: {last_err}")
 
 
 def qs(params: dict) -> str:
@@ -1090,8 +1099,13 @@ async def list_tools() -> list[types.Tool]:
         types.Tool(
             name="generate_signalflow_program",
             description=(
-                "Translate a natural language question into a valid SignalFlow program string "
+                "Generate a SignalFlow program string from a natural language question, "
                 "ready to pass to execute_signalflow.\n\n"
+                "Note: this tool uses keyword/template matching — it is NOT AI-backed. "
+                "It recognises common intents (error rate, latency, throughput, CPU, memory) "
+                "and returns a pre-built SignalFlow program. For anything outside those patterns "
+                "it returns a generic template. Always review the output before treating it as "
+                "authoritative.\n\n"
                 "SignalFlow syntax reference:\n"
                 "  data('metric.name', filter=filter('dim','val')).mean().publish()\n"
                 "  data('spans.count', filter=filter('sf_environment','prod') and filter('sf_service','api')).sum().publish()\n"

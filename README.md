@@ -74,7 +74,7 @@ Add to your `claude_desktop_config.json`:
       ],
       "env": {
         "SPLUNK_ACCESS_TOKEN": "your-access-token",
-        "SPLUNK_REALM": "us1"
+        "SPLUNK_REALM": "us0"
       }
     }
   }
@@ -93,7 +93,7 @@ pip install mcp
       "args": ["/absolute/path/to/o11y-mcp/server.py"],
       "env": {
         "SPLUNK_ACCESS_TOKEN": "your-access-token",
-        "SPLUNK_REALM": "us1"
+        "SPLUNK_REALM": "us0"
       }
     }
   }
@@ -110,6 +110,51 @@ pip install mcp
 ### 3. Restart Claude Desktop
 
 After saving the config, restart Claude Desktop. The Splunk tools will appear in the tools panel.
+
+---
+
+### 4. Configure VS Code or Cursor *(optional)*
+
+Add a `.vscode/mcp.json` (VS Code) or `~/.cursor/mcp.json` (Cursor) file:
+
+**With `uv`:**
+```json
+{
+  "servers": {
+    "splunk-observability": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--with", "mcp[cli]",
+        "--script",
+        "/absolute/path/to/o11y-mcp/server.py"
+      ],
+      "env": {
+        "SPLUNK_ACCESS_TOKEN": "your-access-token",
+        "SPLUNK_REALM": "us0"
+      }
+    }
+  }
+}
+```
+
+**With `pip`:**
+```json
+{
+  "servers": {
+    "splunk-observability": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["/absolute/path/to/o11y-mcp/server.py"],
+      "env": {
+        "SPLUNK_ACCESS_TOKEN": "your-access-token",
+        "SPLUNK_REALM": "us0"
+      }
+    }
+  }
+}
+```
 
 ---
 
