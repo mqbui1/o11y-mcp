@@ -111,8 +111,6 @@ pip install mcp
 
 After saving the config, restart Claude Desktop. The Splunk tools will appear in the tools panel.
 
----
-
 ### 4. Configure VS Code or Cursor *(optional)*
 
 Add a `.vscode/mcp.json` (VS Code) or `~/.cursor/mcp.json` (Cursor) file:
@@ -206,5 +204,6 @@ Find the slowest traces in the last hour and analyze what's causing the latency
 o11y-mcp/
 ├── server.py                  # MCP server — all tools defined here
 ├── requirements.txt           # mcp>=1.0.0
-└── claude_desktop_config.json # Example config (tokens redacted)
+├── .mcp.json                  # MCP config for VS Code / Cursor (tokens redacted)
+└── claude_desktop_config.json # MCP config for Claude Desktop (tokens redacted)
 ```
