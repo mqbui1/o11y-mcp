@@ -155,34 +155,12 @@ Find the slowest traces in the last hour and analyze what's causing the latency
 
 ---
 
-## Skills (Claude Code)
-
-The `skills/` directory contains [Claude Code skill files](https://docs.anthropic.com/en/docs/claude-code/skills) — structured guidance that tells Claude *how* to use the MCP tools effectively for common workflows. These are not part of the MCP server itself; they are loaded by Claude Code when you invoke them.
-
-| Skill | What it does |
-|---|---|
-| `production-investigation` | Step-by-step incident triage: orient → characterize → localize → drill into traces → verify → resolve |
-| `create-splunk-dashboard` | Design and build dashboards with golden signals, validated SignalFlow, and proper grid layout |
-| `detectors-and-alerts` | Create and tune detectors with correct SignalFlow `detect()` programs and alert severity |
-| `signalflow-queries` | Write and debug SignalFlow programs — syntax rules, filters, aggregations, common pitfalls |
-| `apm-traces` | Search and interpret distributed traces, span tags, latency contributors, and the service map |
-
-To use a skill in Claude Code, run `/production-investigation` or `/create-splunk-dashboard` etc.
-
----
-
 ## Project structure
 
 ```
 o11y-mcp/
-├── o11y-mcp/
-│   ├── server.py                  # MCP server — all tools defined here
-│   ├── requirements.txt           # mcp>=1.0.0
-│   └── claude_desktop_config.json # Example config (tokens redacted)
-└── skills/                        # Claude Code skills (not part of the server)
-    ├── production-investigation/
-    ├── create-splunk-dashboard/
-    ├── detectors-and-alerts/
-    ├── signalflow-queries/
-    └── apm-traces/
+└── o11y-mcp/
+    ├── server.py                  # MCP server — all tools defined here
+    ├── requirements.txt           # mcp>=1.0.0
+    └── claude_desktop_config.json # Example config (tokens redacted)
 ```
